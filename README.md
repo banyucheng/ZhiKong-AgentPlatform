@@ -1,0 +1,319 @@
+# ZhiKong Agent Platform
+
+企业级多功能 AI Agent 平台。支持 RAG 知识库、多模型流式对话、Agent 编排与 Skill 系统、可视化工作流（DAG）、监控看板、多租户 RBAC，以及图片 / 语音 / 文档多模态处理。
+
+## 系统架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   前端 (React + Vite)                     │
+│   React 18 / TypeScript / Shadcn/ui / Tailwind / Zustand │
+└──────────┬──────────────────────┬───────────────────────┘
+           │ HTTP (REST)          │ WebSocket / SSE
+┌──────────▼──────────────────────▼───────────────────────┐
+│              网关 (Spring Boot 3.2.5)                     │
+│  CORS / WebSocket / RabbitMQ / Security / 多租户          │
+├──────────┬──────────┬──────────┬──────────┬─────────────┤
+│   认证   │   租户   │ 知识库   │   会话   │    编排      │
+│   JWT    │   配额   │ 文档/RAG │   聊天   │  智能体/工具  │
+├──────────┴──────────┴──────────┴──────────┴─────────────┤
+│           工作流 (DAG)       │      监控 (API/Token)      │
+└─────────────────────────────┴────────────────────────────┘
+           │ RabbitMQ (异步任务)  │ HTTP (流式传输)
+┌──────────▼──────────────────────────────────────────────┐
+│               AI 引擎 (Python FastAPI)                    │
+│  LangChain / LangGraph / Celery / Pgvector                │
+│  多模型: DeepSeek · GPT-4o · Qwen · GLM-4 · Gemini         │
+└─────────────────────────────────────────────────────────┘
+           │        │          │
+┌──────────▼──┐ ┌──▼───┐ ┌───▼──────────┐
+│  PostgreSQL  │ │Redis │ │  RabbitMQ     │
+│  + pgvector  │ │      │ │               │
+└──────────────┘ └──────┘ └───────────────┘
+```
+
+## 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| **前端** | React 18, TypeScript, Vite, Tailwind CSS, Shadcn/ui, Zustand, React Flow, Recharts |
+| **后端** | Java 17, Spring Boot 3.2.5, Spring Security, JWT (jjwt 0.12.5), MyBatis-Plus 3.5.9, Spring AMQP |
+| **AI 引擎** | Python 3.10+, FastAPI, LangChain 1.0, LangGraph 1.0 (StateGraph + Checkpoint), MCP 协议, 三态熔断器 |
+| **数据库** | PostgreSQL 15 + pgvector 扩展, Redis 7 |
+| **消息队列** | RabbitMQ 3.12 |
+| **基础设施** | Docker Compose |
+
+## 项目结构
+
+```
+ZhiKong-AgentPlatform/
+├── docker/
+│   └── docker-compose.yml          # PostgreSQL+pgvector, Redis, RabbitMQ
+├── agent-backend/                  # Java Spring Boot 多模块
+│   ├── pom.xml                     # 父 POM（9 个模块）
+│   ├── agent-common/               # Result, BaseEntity, 异常处理, MyBatis-Plus 配置
+│   ├── agent-auth/                 # 用户/角色/权限, JWT, Spring Security
+│   ├── agent-tenant/               # 租户, 配额, 租户拦截器
+│   ├── agent-knowledge/            # 文档解析, 分块, 多模态
+│   ├── agent-conversation/         # 会话, 消息, SSE 流式对话
+│   ├── agent-orchestration/        # Agent 配置, 提示词模板, 工具定义
+│   ├── agent-workflow/             # 工作流定义, 节点, 连线 (DAG)
+│   ├── agent-monitor/              # API 日志, Token 用量监控
+│   └── agent-gateway/              # Spring Boot 入口, CORS/WS/MQ 配置
+├── agent-engine/                   # Python AI 引擎
+│   ├── main.py                     # FastAPI 入口
+│   ├── config.py                   # Pydantic 配置
+│   ├── models/
+│   │   ├── model_manager.py        # 多模型路由 (OpenAI 兼容, 含 Gemini)
+│   │   ├── multimodal.py           # 图片 Base64 编码 + 多模态消息构建
+│   │   └── circuit_breaker.py      # 三态熔断器 + 优先级降级链 + 健康监控
+│   ├── tools/
+│   │   └── tool_registry.py        # 工具注册表 (内置 + MCP 动态发现)
+│   ├── eval/                       # 评测模块（RAG + Agent + 幻觉率）
+│   │   ├── evaluators.py           # LLM-as-judge 评测指标
+│   │   ├── test_cases.py           # 内置评测用例
+│   │   ├── suite_loader.py         # 外部 JSON 套件加载器
+│   │   └── test_suites/            # JSON 评测套件（不改代码即可新增）
+│   ├── agents/
+│   │   ├── chat_agent.py           # 多轮对话 + 流式输出 (含视觉模型支持)
+│   │   └── skill_agent.py          # Tool Calling Agent + AgentExecutor 流式
+│   ├── rag/
+│   │   ├── vector_store.py         # Pgvector 集成
+│   │   └── retriever.py            # RAG 检索 + 提示词构建
+│   ├── workflows/
+│   │   └── workflow_executor.py    # LangGraph DAG 执行器
+│   └── tasks/
+│       ├── celery_app.py           # Celery 配置
+│       ├── doc_process.py          # 异步文档处理 + 图片描述
+│       └── workflow_exec.py        # 异步工作流执行
+└── agent-frontend/                 # React TypeScript 前端
+    ├── src/
+    │   ├── api/client.ts           # HTTP API 客户端
+    │   ├── store/appStore.ts       # Zustand 全局状态
+    │   ├── components/
+    │   │   ├── layout/             # 侧边栏, 顶栏
+    │   │   └── chat/               # ImageUploader, AudioRecorder
+    │   └── pages/                  # 仪表盘/聊天/知识库/工作流/监控/设置/登录
+    ├── vite.config.ts
+    ├── tailwind.config.js
+    └── package.json
+```
+
+## 功能概览
+
+### 核心功能
+- **RAG 知识库** — 上传 PDF/Word/Markdown/HTML/TXT/图片，自动解析、分块、向量化存入 Pgvector
+- **多轮对话** — SSE 流式输出，RAG 增强，支持多模型切换；会话记忆（滑动窗口 + Token 压缩 + PII 脱敏 + 话题检测）
+- **Agent 编排** — 可配置智能体 + 工具定义 + Skill 封装（Agent + 工具 + 工作流打包），语义路由自动匹配最佳技能
+- **Tool Calling** — 内置 DuckDuckGo 搜索、Wikipedia 百科、arXiv 论文等工具，Agent 自动决策调用时机
+- **可视化工作流** — React Flow 拖拽式 DAG 画布，LangGraph StateGraph 编译为可执行 DAG
+- **监控看板** — Token 用量图表、API 调用日志、系统状态
+- **多租户 RBAC** — 租户隔离、JWT 认证、用户/角色/权限管理
+
+### 多模态
+- **文档类型**: PDF、Word (.docx)、Markdown、HTML、TXT
+- **图片支持**: JPG、PNG、GIF、WebP、BMP — 本地存储，24h 自动清理
+- **PDF 图片提取**: PyMuPDF (Python) + PDFBox (Java) 双引擎
+- **视觉问答**: 聊天中上传图片，视觉模型 (GPT-4o/GLM-4v/Qwen-VL/Gemini) 理解并回答；模型不支持视觉时自动回退纯文本
+- **语音输入**: 浏览器录音 → Whisper STT → 文字填入输入框
+
+### 多模型
+支持 OpenAI 兼容 API：DeepSeek、GPT-4o、Qwen、GLM-4、Gemini，按优先级降级链自动切换。
+
+### 混合通信
+- **HTTP (同步)**: REST API + SSE 流式对话
+- **RabbitMQ (异步)**: 文档处理、工作流执行通过 Celery 调度
+
+## 快速开始
+
+### 前置条件
+- Java 17+, Maven 3.9+
+- Python 3.10+, Node.js 18+
+- Docker Desktop
+
+### 1. 启动基础设施
+
+```bash
+cd docker
+docker compose up -d
+```
+
+启动服务: PostgreSQL:5432, Redis:6379, RabbitMQ:15672 (管理界面)
+
+### 2. 创建数据库
+
+连接 PostgreSQL 执行:
+
+```sql
+CREATE DATABASE agent_platform;
+CREATE EXTENSION vector;  -- pgvector
+```
+
+### 3. 启动 Java 后端
+
+```bash
+cd agent-backend
+mvn clean compile
+mvn -pl agent-gateway spring-boot:run
+```
+
+网关启动在 **http://localhost:9090**。
+
+**默认账号**（首次启动自动创建）:
+- 用户名: `admin`，密码: `admin123`
+
+### 4. 配置 API Key
+
+编辑 `agent-engine/.env`，至少填入一个模型的 API Key:
+
+```
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+```
+
+### 5. 启动 Python AI 引擎
+
+```bash
+cd agent-engine
+pip install -r requirements.txt
+python main.py
+```
+
+引擎启动在 **http://localhost:8000**。
+
+> **Windows 注意**: 如启动后立刻 shutdown，通常是 reload 监控到 `__pycache__` 等文件变化导致。已在 `main.py` 中配置 `reload_dirs` + `reload_excludes` 解决。
+
+### 6. 启动 Celery Worker（可选）
+
+```bash
+cd agent-engine
+celery -A tasks.celery_app worker --loglevel=info
+```
+
+### 7. 启动前端
+
+```bash
+cd agent-frontend
+npm install
+npm run dev
+```
+
+前端启动在 **http://localhost:3000**。
+
+## API 端点
+
+### 认证
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/auth/login` | 用户名密码登录，返回 JWT |
+| POST | `/api/auth/register` | 注册新用户 |
+
+### 租户
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/tenants` | 租户列表 |
+| POST | `/api/tenants` | 创建租户 |
+| PUT | `/api/tenants/{id}` | 更新租户 |
+| DELETE | `/api/tenants/{id}` | 删除租户 |
+| GET | `/api/tenants/{id}/quota` | 查看配额 |
+| PUT | `/api/tenants/{id}/quota` | 更新配额 |
+
+### 知识库
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/knowledge/documents/upload` | 上传文档 (multipart) |
+
+### 会话
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/conversations` | 会话列表 |
+| POST | `/api/conversations` | 创建会话 |
+| POST | `/api/conversations/stream` | SSE 流式对话（无会话ID） |
+| POST | `/api/conversations/{id}/stream` | SSE 流式对话（上下文记忆 + 话题检测） |
+| GET | `/api/conversations/{id}/messages` | 历史消息 |
+| POST | `/api/conversations/upload-image` | 上传聊天图片 |
+| POST | `/api/conversations/transcribe` | 语音转文字（multipart audio → Whisper） |
+
+### 编排
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/orchestration/agents` | 智能体配置列表 |
+| POST | `/api/orchestration/agents` | 创建智能体配置 |
+| PUT | `/api/orchestration/templates/{id}` | 更新提示词模板 |
+| POST | `/api/orchestration/tools` | 创建工具定义 |
+| GET | `/api/orchestration/skills` | Skill 列表 |
+| POST | `/api/orchestration/skills` | 创建 Skill |
+| POST | `/api/orchestration/skills/{id}/tools` | 为 Skill 绑定工具 |
+
+### 工作流
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/workflows` | 工作流列表 |
+| POST | `/api/workflows` | 创建工作流 |
+| GET | `/api/workflows/{id}/dag` | 获取 DAG（节点+连线） |
+| PUT | `/api/workflows/{id}/dag` | 保存 DAG |
+
+### 监控
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/monitor/api-logs` | API 调用日志 |
+| GET | `/api/monitor/token-usage?date=2024-01-01` | 按日期查询 Token 用量 |
+
+### AI 引擎
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查 |
+| POST | `/chat/stream` | SSE 流式对话（含多模态 vision 支持） |
+| POST | `/chat/rag` | RAG 增强流式对话（含多模态） |
+| POST | `/chat/agent` | Skill Agent 流式对话（带工具调用） |
+| POST | `/skills/route` | 语义路由匹配最佳 Skill |
+| GET | `/skills/tools` | 列出所有工具（内置 + MCP） |
+| POST | `/rag/retrieve` | 检索文档 |
+| POST | `/rag/embed` | 文本向量化 |
+| POST | `/memory/summarize` | 压缩旧消息为摘要 |
+| POST | `/speech/transcribe` | Whisper 语音转文字 |
+| GET | `/models/supported` | 支持的模型列表 |
+| GET | `/models/health` | 模型熔断器健康状态 |
+| GET | `/mcp/servers` | MCP 服务器列表和已加载工具 |
+| POST | `/eval/all` | 一键全量评测 |
+| POST | `/workflow/execute` | 同步执行工作流 |
+
+## 环境变量
+
+### Java 后端 (`application.yml`)
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `jwt.secret` | (base64 密钥) | JWT 签名密钥 |
+| `jwt.expiration` | 86400000 | Token 过期时间 (毫秒) |
+| `ai.engine.url` | http://localhost:8000 | Python 引擎地址 |
+
+### Python 引擎 (`.env`)
+| 变量 | 说明 |
+|------|------|
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
+| `OPENAI_API_KEY` | OpenAI API 密钥（GPT-4o + Whisper 语音转写） |
+| `QWEN_API_KEY` | 通义千问 API 密钥 |
+| `GLM_API_KEY` | 智谱 GLM-4 API 密钥 |
+| `GEMINI_API_KEY` | Google Gemini API 密钥 |
+
+### Docker 服务
+| 服务 | 端口 | 账号/密码 |
+|------|------|-----------|
+| PostgreSQL | 5432 | agent / agent123 |
+| Redis | 6379 | — |
+| RabbitMQ | 5672 (AMQP) / 15672 (管理界面) | agent / agent123 |
+
+## 设计决策
+
+- **Java + Python 双后端**: Java 负责业务逻辑与权限、租户、监控等企业能力，Python 充分利用 LangChain/LangGraph 生态做 AI 引擎，二者通过 HTTP（流式）+ RabbitMQ（异步任务）通信
+- **MyBatis-Plus + Lombok**: 持久层用 `BaseMapper` + `LambdaQueryWrapper`，实体类 `@Getter/@Setter` 减少样板代码；注意需 `JAVA_HOME` 指向 JDK 17
+- **Schema 管理**: 用 `schema.sql` 定义 DDL（`spring.sql.init.mode=always`），启动即建表，不依赖 ORM 自动建表
+- **会话记忆系统**: Redis + PostgreSQL 两级缓存，20 轮滑动窗口（LTRIM），Token 超 4000 自动压缩旧消息为摘要，PII（手机/身份证/邮箱/银行卡）入缓存前脱敏，语义话题检测自动分子会话
+- **多模型高可用**: 三态熔断器（Closed→Open→Half-Open），连续 3 次失败自动熔断，冷却后半开试探恢复；14 个模型按优先级组成降级链，降级时同步调低 temperature/max_tokens 保可用，8s 首包探测超时判定模型不健康
+- **LangGraph Agent**: 自定义 4 节点 StateGraph（agent→tools→review），ReAct 循环处理工具调用；review 节点审查输出质量，不合格自动打回重试（最多 3 次）；MemorySaver checkpoint 持久化节点状态，支持断点恢复
+- **MCP 协议接入**: `MultiServerMCPClient` 管理多个 MCP Server（filesystem / GitHub / PostgreSQL），懒加载 + 10s 连接超时 + 工具缓存，与内置工具统一路由
+- **评测体系**: LLM-as-judge 模式，5 项指标（faithfulness / relevancy / precision / recall / 幻觉率）；评测套件外置为 JSON，投文件即生效，报告自动落盘
+- **图片先上传后引用**: 聊天图片先上传至 `uploads/chat-images/` 获得 URL 再随消息发送，避免大体积 base64 传输；每日凌晨 3 点清理 24h 前的图片
+- **语音只做 STT**: MediaRecorder 录音 → Whisper 转文字 → 填入输入框，用户确认后发送；不做 TTS，保持交互可控
+- **统一错误码**: `ErrorCode` 枚举集中管理业务错误码，`BusinessException` 携带 ErrorCode，全局异常处理器统一响应
+- **Pgvector 单库**: 关系数据与向量检索共用一个 PostgreSQL，减少运维成本
+- **认证方案**: 采用 JWT 用户名密码认证保持轻量，OAuth2/OIDC 作为后续扩展方向

@@ -1,0 +1,164 @@
+# Chat Agent: 多轮对话 + 流式输出 + 多模态 + 熔断降级
+from typing import AsyncIterator, List, Dict, Optional
+import asyncio
+import logging
+from datetime import datetime
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from models.model_manager import create_llm, supports_vision
+from models.multimodal import build_multimodal_content
+from models.circuit_breaker import health_monitor, resolve_fallback, get_degrade_config
+from rag.retriever import retrieve_context, build_rag_prompt
+
+logger = logging.getLogger("chat_agent")
+
+FIRST_TOKEN_TIMEOUT = 8.0  # 首包超时秒数
+
+
+def format_messages(history: List[Dict], system_prompt: str = None) -> list:
+    messages = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    for msg in history:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            messages.append(AIMessage(content=content))
+    return messages
+
+
+async def _stream_with_probe(llm, messages) -> AsyncIterator[str]:
+    """本地生成器：用 asyncio.wait_for 探测流式首包"""
+    #astream这个api是用来获取流式输出的，但如果包卡死，会阻塞等待，直到超时 or 关闭连接
+    # 所以这里用 asyncio.wait_for 来限制等待时间，避免阻塞等待
+    agen = llm.astream(messages)
+
+    try:
+        # 先获取第一个token，判断是否超时，这个__aiter__()是用于获取异步迭代器的
+        agen_aiter = agen.__aiter__()
+        # __anext__()是异步迭代器的下一个元素，用于获取下一个token
+        # 这里用 asyncio.wait_for 来限制等待时间，避免阻塞等待，超时后抛出异常，
+        # 使调用者能够及时处理超时情况，而不是等待无限期
+        first = await asyncio.wait_for(agen_aiter.__anext__(), timeout=FIRST_TOKEN_TIMEOUT)
+        content = first.content if hasattr(first, "content") else str(first)
+        if content:
+            yield content
+        async for chunk in agen_aiter:
+            c = chunk.content if hasattr(chunk, "content") else str(chunk)
+            if c:
+                yield c
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"First token timeout ({FIRST_TOKEN_TIMEOUT}s)")
+    
+async def chat_stream(
+    query: str,
+    history: List[Dict],
+    model: str = None,
+    system_prompt: str = None,
+    temperature: float = 0.7,
+    image_url: Optional[str] = None,
+) -> AsyncIterator[str]:
+    """流式对话，带三态熔断 + 优先级降级 + 首包探测"""
+    model_name = model or "deepseek-chat"
+    candidates = resolve_fallback(model_name)
+
+    last_error = None
+    for level, candidate in enumerate(candidates):
+        # allow() 在冷却期满时会将 OPEN 转为 HALF_OPEN 并放行试探请求，
+        # 使熔断模型能够自动恢复；is_model_open() 是纯只读检查，无状态转移
+        if not health_monitor.allow(candidate):
+            logger.info("Circuit %s OPEN, skipping", candidate)
+            continue
+
+        if image_url and not supports_vision(candidate):
+            continue
+
+        degrade = get_degrade_config(level)
+        effective_temp = temperature if level == 0 else degrade["temperature"]
+
+        try:
+            llm = create_llm(model_name=candidate, temperature=effective_temp,
+                             max_tokens=degrade["max_tokens"], streaming=True)
+            today = datetime.now().strftime("%Y年%m月%d日 %A")
+            date_note = f"今天是 {today}。"
+            messages = format_messages(history, system_prompt)
+            if not system_prompt:
+                messages.insert(0, SystemMessage(content=date_note))
+            else:
+                messages[0] = SystemMessage(content=f"{date_note}\n{messages[0].content}")
+            if image_url:
+                messages.append(HumanMessage(content=build_multimodal_content(query, image_url)))
+            else:
+                messages.append(HumanMessage(content=query))
+
+            logger.info("chat_stream: trying %s (level=%d)", candidate, level)
+            async for token in _stream_with_probe(llm, messages):
+                yield token
+            health_monitor.success(candidate)
+            return
+
+        except (TimeoutError, Exception) as e:
+            health_monitor.failure(candidate)
+            last_error = e
+            logger.warning("Model %s failed (level=%d): %s", candidate, level, e)
+            continue
+
+    err_msg = f"所有模型不可用, last_error={last_error}"
+    logger.error(err_msg)
+    yield f"[错误] {err_msg}"
+
+
+async def rag_chat_stream(
+    query: str,
+    history: List[Dict],
+    model: str = None,
+    system_prompt: str = None,
+    temperature: float = 0.7,
+    top_k: int = 5,
+    image_url: Optional[str] = None,
+) -> AsyncIterator[str]:
+    """RAG 增强对话，带熔断降级"""
+    model_name = model or "deepseek-chat"
+    candidates = resolve_fallback(model_name)
+
+    context_docs = retrieve_context(query, top_k)
+    rag_system = build_rag_prompt(query, context_docs, system_prompt)
+
+    last_error = None
+    for level, candidate in enumerate(candidates):
+        if not health_monitor.allow(candidate):
+            continue
+        if image_url and not supports_vision(candidate):
+            continue
+
+        degrade = get_degrade_config(level)
+        effective_temp = temperature if level == 0 else degrade["temperature"]
+
+        try:
+            llm = create_llm(model_name=candidate, temperature=effective_temp,
+                             max_tokens=degrade["max_tokens"], streaming=True)
+            today = datetime.now().strftime("%Y年%m月%d日 %A")
+            date_note = f"今天是 {today}。"
+            messages = format_messages(history)
+            messages.insert(0, SystemMessage(content=f"{date_note}\n{rag_system}"))
+            if image_url:
+                messages.append(HumanMessage(content=build_multimodal_content(query, image_url)))
+            else:
+                messages.append(HumanMessage(content=query))
+
+            logger.info("rag_chat_stream: trying %s (level=%d)", candidate, level)
+            async for token in _stream_with_probe(llm, messages):
+                yield token
+            health_monitor.success(candidate)
+            return
+
+        except (TimeoutError, Exception) as e:
+            health_monitor.failure(candidate)
+            last_error = e
+            logger.warning("RAG model %s failed (level=%d): %s", candidate, level, e)
+            continue
+
+    err_msg = f"所有模型不可用, last_error={last_error}"
+    logger.error(err_msg)
+    yield f"[错误] {err_msg}"
