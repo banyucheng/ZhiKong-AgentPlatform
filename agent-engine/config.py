@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     chunk_overlap: int = 50
     top_k: int = 5
 
+    # RAG 检索升级：混合召回 + 重排
+    retrieve_candidates: int = 20      # 每路召回的候选片段数（RRF 融合后交给重排）
+    enable_hybrid: bool = True         # BM25 稀疏召回 + RRF 融合开关
+    enable_rerank: bool = True         # bge-reranker-v2-m3 精排开关（首次运行自动下载 ~2GB）
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    bm25_ttl: int = 60                 # BM25 索引缓存秒数（celery 写入向量库后另一进程需靠 TTL 刷新）
+
     # Vision models (support image input)
     vision_models: list = [
         "gpt-4o", "gpt-4-turbo",

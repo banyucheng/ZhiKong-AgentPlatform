@@ -99,6 +99,9 @@ def add_documents(docs: List[tuple[str, dict]], collection_name: str = "agent_kn
         doc_id = str(uuid.uuid7())
         documents.append(Document(page_content=text, metadata=metadata, id=doc_id))
     store.add_documents(documents)
+    # 新文档入库后失效 BM25 缓存（hybrid 召回需要最新语料）
+    from rag.hybrid import invalidate_bm25
+    invalidate_bm25(collection_name)
     return len(documents)
 
 
